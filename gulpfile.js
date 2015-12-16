@@ -16,6 +16,7 @@ var fs = fsExtra;
 var exec = require('child_process').exec;
 var execPromise = Q.denodeify(exec);
 var prompt = require('prompt');
+var globby = require("globby");
 
 // TODO:
 //  1. Think about using runSequence
@@ -25,11 +26,15 @@ var TOOLS_PATH = './tools';
 var ANGULAR_PROJECT_PATH = '../angular';
 var PUBLIC_PATH = './public';
 var DOCS_PATH = path.join(PUBLIC_PATH, 'docs');
+var EXAMPLES_PATH = path.join(DOCS_PATH, '_examples');
 var NOT_API_DOCS_GLOB = path.join(PUBLIC_PATH, './{docs/*/latest/!(api),!(docs)}/**/*');
 var RESOURCES_PATH = path.join(PUBLIC_PATH, 'resources');
+var LIVE_EXAMPLES_PATH = path.join(RESOURCES_PATH, 'live-examples');
 
 var docShredder = require(path.resolve(TOOLS_PATH, 'doc-shredder/doc-shredder'));
 var exampleZipper = require(path.resolve(TOOLS_PATH, '_example-zipper/exampleZipper'));
+var plunkerBuilder = require(path.resolve(TOOLS_PATH, 'plunker-builder/plunkerBuilder'));
+var fsUtils = require(path.resolve(TOOLS_PATH, 'fs-utils/fsUtils'));
 
 var _devguideShredOptions =  {
   examplesDir: path.join(DOCS_PATH, '_examples'),
@@ -49,7 +54,7 @@ var _excludeMatchers = _excludePatterns.map(function(excludePattern){
   return new Minimatch(excludePattern)
 });
 
-
+var _exampleBoilerplateFiles = ['package.json', 'tsconfig.json', 'karma.conf.js', 'karma-test-shim.js' ]
 
 // Public tasks
 
@@ -63,25 +68,50 @@ gulp.task('help', taskListing.withFilters(function(taskName) {
   return shouldRemove;
 }));
 
+// requires admin access
+gulp.task('add-example-boilerplate',  function() {
+  var realPath = path.join(EXAMPLES_PATH, '/node_modules');
+  var nodeModulesPaths = getNodeModulesPaths(EXAMPLES_PATH);
+
+  nodeModulesPaths.forEach(function(linkPath) {
+    gutil.log("symlinking " + linkPath + ' -> ' + realPath)
+    fsUtils.addSymlink(realPath, linkPath);
+  });
+  var sourceFiles = _exampleBoilerplateFiles.map(function(fn) {
+    return path.join(EXAMPLES_PATH, fn);
+  });
+  var examplePaths = getExamplePaths(EXAMPLES_PATH);
+  return copyFiles(sourceFiles, examplePaths );
+});
+
+gulp.task('remove-example-boilerplate', function() {
+  var nodeModulesPaths = getNodeModulesPaths(EXAMPLES_PATH);
+  nodeModulesPaths.forEach(function(linkPath) {
+    fsUtils.removeSymlink(linkPath);
+  });
+  var examplePaths = getExamplePaths(EXAMPLES_PATH);
+  return deleteFiles(_exampleBoilerplateFiles, examplePaths );
+});
+
 gulp.task('serve-and-sync', ['build-docs'], function (cb) {
   watchAndSync({devGuide: true, apiDocs: true, apiExamples: true, localFiles: true}, cb);
 });
 
-gulp.task('serve-and-sync-api-docs', ['build-docs'], function (cb) {
+gulp.task('serve-and-sync-api', ['build-docs'], function (cb) {
   watchAndSync({apiDocs: true, apiExamples: true}, cb);
 });
 
-gulp.task('serve-and-sync-devGuide', ['build-docs'], function (cb) {
-  watchAndSync({devGuide: true}, cb);
+gulp.task('serve-and-sync-devguide', ['build-devguide-docs', 'build-plunkers', '_zip-examples'], function (cb) {
+  watchAndSync({devGuide: true, localFiles: true}, cb);
 });
 
 gulp.task('build-and-serve', ['build-docs'], function (cb) {
   watchAndSync({localFiles: true}, cb);
 });
 
-gulp.task('build-docs', ['build-devguide-docs', 'build-api-docs', '_zip-examples']);
+gulp.task('build-docs', ['build-devguide-docs', 'build-api-docs', 'build-plunkers', '_zip-examples']);
 
-gulp.task('build-api-docs', ['build-js-api-docs', 'build-ts-api-docs']);
+gulp.task('build-api-docs', ['build-js-api-docs', 'build-ts-api-docs', 'build-dart-cheatsheet']);
 
 gulp.task('build-devguide-docs', ['_shred-devguide-examples'], function() {
   return buildShredMaps(true);
@@ -95,9 +125,13 @@ gulp.task('build-js-api-docs', ['_shred-api-examples'], function() {
   return buildApiDocs('js');
 });
 
+gulp.task('build-plunkers', function() {
+  return plunkerBuilder.buildPlunkers(EXAMPLES_PATH, LIVE_EXAMPLES_PATH, { errFn: gutil.log });
+});
 
-
-
+gulp.task('build-dart-cheatsheet', [], function() {
+  return buildApiDocs('dart');
+});
 
 gulp.task('git-changed-examples', ['_shred-devguide-examples'], function(){
   var after, sha, messageSuffix;
@@ -148,6 +182,7 @@ gulp.task('git-changed-examples', ['_shred-devguide-examples'], function(){
 gulp.task('check-deploy', ['build-docs'], function() {
   gutil.log('running harp compile...');
   return execPromise('npm run harp -- compile . ./www', {}).then(function() {
+    gutil.log('compile ok - running live server ...');
     execPromise('npm run live-server ./www');
     return askDeploy();
   }).then(function(shouldDeploy) {
@@ -159,6 +194,8 @@ gulp.task('check-deploy', ['build-docs'], function() {
     }
   }).then(function(s) {
     gutil.log(s.join(''));
+  }).catch(function(e) {
+    gutil.log(e);
   });
 });
 
@@ -168,9 +205,9 @@ gulp.task('test-api-builder', function (cb) {
 });
 
 
-
-
 // Internal tasks
+
+
 
 gulp.task('_shred-devguide-examples', ['_shred-clean-devguide'], function() {
   return docShredder.shred( _devguideShredOptions);
@@ -198,6 +235,55 @@ gulp.task('_zip-examples', function() {
 
 
 // Helper functions
+
+// returns a promise
+function copyFiles(fileNames, destPaths) {
+  var copy = Q.denodeify(fsExtra.copy);
+  var copyPromises = [];
+  destPaths.forEach(function(destPath) {
+    fileNames.forEach(function(fileName) {
+      var baseName = path.basename(fileName);
+      var destName = path.join(destPath, baseName);
+      var p = copy(fileName, destName, { clobber: true});
+      copyPromises.push(p);
+    });
+  });
+  return Q.all(copyPromises);
+}
+
+function deleteFiles(baseFileNames, destPaths) {
+  var remove = Q.denodeify(fsExtra.remove);
+  var delPromises = [];
+  destPaths.forEach(function(destPath) {
+    baseFileNames.forEach(function(baseFileName) {
+      var destFileName = path.join(destPath, baseFileName);
+      var p = remove(destFileName);
+      delPromises.push(p);
+    });
+  });
+  return Q.all(delPromises);
+}
+
+function getExamplePaths(basePath) {
+  var jsonPattern = path.join(basePath, "**/example-config.json");
+  // ignore (skip) the top level version.
+  var exceptJsonPattern = "!" + path.join(basePath, "/example-config.json");
+  var nmPattern =  path.join(basePath, "**/node_modules/**");
+  var fileNames = globby.sync( [ jsonPattern, exceptJsonPattern ], { ignore: [nmPattern] } );
+  // same as above but perf can differ.
+  // var fileNames = globby.sync( [jsonPattern, "!" + nmPattern]);
+  var paths = fileNames.map(function(fileName) {
+    return path.dirname(fileName);
+  });
+  return paths;
+}
+
+function getNodeModulesPaths(basePath) {
+  var paths = getExamplePaths(basePath).map(function(examplePath) {
+    return path.join(examplePath, "/node_modules");
+  });
+  return paths;
+}
 
 function watchAndSync(options, cb) {
 
@@ -278,7 +364,10 @@ function apiExamplesWatch(postShredAction) {
 function devGuideExamplesWatch(shredOptions, postShredAction) {
   var includePattern = path.join(shredOptions.examplesDir, '**/*.*');
   var excludePattern = '!' + path.join(shredOptions.examplesDir, '**/node_modules/**/*.*');
-  gulp.watch([includePattern, excludePattern], {readDelay: 500}, function (event, done) {
+  // removed this version because gulp.watch has the same glob issue that dgeni has.
+  // gulp.watch([includePattern, excludePattern], {readDelay: 500}, function (event, done) {
+  var files = globby.sync( [includePattern], { ignore: [ '**/node_modules/**']});
+  gulp.watch([files], {readDelay: 500}, function (event, done) {
     gutil.log('Dev Guide example changed')
     gutil.log('Event type: ' + event.type); // added, changed, or deleted
     gutil.log('Event path: ' + event.path); // The path of the modified file
@@ -287,18 +376,23 @@ function devGuideExamplesWatch(shredOptions, postShredAction) {
 }
 
 
-
 // Generate the API docs for the specified language, if not specified then it defaults to ts
 function buildApiDocs(targetLanguage) {
-  var ALLOWED_LANGUAGES = ['ts', 'js'];
+  var ALLOWED_LANGUAGES = ['ts', 'js', 'dart'];
+  var GENERATE_API_LANGUAGES = ['ts', 'js'];
   checkAngularProjectPath();
   try {
     // Build a specialized package to generate different versions of the API docs
     var package = new Package('apiDocs', [require(path.resolve(TOOLS_PATH, 'api-builder/angular.io-package'))]);
-    package.config(function(targetEnvironments, writeFilesProcessor) {
+    package.config(function(targetEnvironments, writeFilesProcessor, readTypeScriptModules) {
       ALLOWED_LANGUAGES.forEach(function(target) { targetEnvironments.addAllowed(target); });
       if (targetLanguage) {
         targetEnvironments.activate(targetLanguage);
+
+        if (GENERATE_API_LANGUAGES.indexOf(targetLanguage) === -1) {
+          // Don't read TypeScript modules if we are not generating API docs - Dart I am looking at you!
+          readTypeScriptModules.$enabled = false;
+        }
         writeFilesProcessor.outputFolder  = targetLanguage + '/latest/api';
       }
     });
@@ -450,6 +544,7 @@ function addKeyValue(map, key, value) {
     map[key] = [value];
   }
 }
+
 
 // Synchronously execute a chain of commands.
 // cmds: an array of commands
